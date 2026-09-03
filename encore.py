@@ -1,3 +1,5 @@
+#Bonjour nous voulons voir
+
 import time
 debut = time.perf_counter()
 
