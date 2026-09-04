@@ -50,7 +50,7 @@ gamma     = 1e-4
 mu_m      = 1.0
 u_imposed = -1.7
 n_steps   = 20
-warp_factor = 1.7
+warp_factor = 1
 
 #  Espace P1 
 V = fem.functionspace(domain, ("Lagrange", 1, (2,)))

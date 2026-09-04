@@ -49,7 +49,7 @@ H2    = 25.6
 H12   = 41.0
 
 lcC = 2.0   # maille grossière
-lcF = 0.1   # maille fine
+lcF = 0.2   # maille fine
 
 # Points dérivés
 r1_top = r1 + h1 / np.tan(alpha)   # = 14.17 mm

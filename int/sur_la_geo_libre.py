@@ -48,7 +48,7 @@ E_2       = 113000.0
 nu_2      = 0.3
 gamma     = 1e-4
 mu_m      = 1.0
-u_imposed = -1.7
+u_imposed = -3.8
 n_steps   = 20
 warp_factor = 1
 

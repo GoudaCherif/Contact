@@ -3,11 +3,11 @@
 <Xdmf Version="3.0" xmlns:xi="https://www.w3.org/2001/XInclude">
   <Domain>
     <Grid Name="mesh" GridType="Uniform">
-      <Topology TopologyType="Triangle" NumberOfElements="18014" NodesPerElement="3">
-        <DataItem Dimensions="18014 3" NumberType="Int" Format="HDF">resultats_sans_regularisation.h5:/Mesh/mesh/topology</DataItem>
+      <Topology TopologyType="Triangle" NumberOfElements="9185" NodesPerElement="3">
+        <DataItem Dimensions="9185 3" NumberType="Int" Format="HDF">resultats_sans_regularisation.h5:/Mesh/mesh/topology</DataItem>
       </Topology>
       <Geometry GeometryType="XY">
-        <DataItem Dimensions="9143 2" Format="HDF">resultats_sans_regularisation.h5:/Mesh/mesh/geometry</DataItem>
+        <DataItem Dimensions="4685 2" Format="HDF">resultats_sans_regularisation.h5:/Mesh/mesh/geometry</DataItem>
       </Geometry>
     </Grid>
     <Grid Name="u" GridType="Collection" CollectionType="Temporal">
@@ -15,7 +15,7 @@
         <xi:include xpointer="xpointer(/Xdmf/Domain/Grid[@GridType='Uniform'][1]/*[self::Topology or self::Geometry])" />
         <Time Value="0" />
         <Attribute Name="u" AttributeType="Vector" Center="Node">
-          <DataItem Dimensions="9143 3" Format="HDF">resultats_sans_regularisation.h5:/Function/u/0</DataItem>
+          <DataItem Dimensions="4685 3" Format="HDF">resultats_sans_regularisation.h5:/Function/u/0</DataItem>
         </Attribute>
       </Grid>
     </Grid>
@@ -24,7 +24,7 @@
         <xi:include xpointer="xpointer(/Xdmf/Domain/Grid[@GridType='Uniform'][1]/*[self::Topology or self::Geometry])" />
         <Time Value="0" />
         <Attribute Name="u_warp" AttributeType="Vector" Center="Node">
-          <DataItem Dimensions="9143 3" Format="HDF">resultats_sans_regularisation.h5:/Function/u_warp/0</DataItem>
+          <DataItem Dimensions="4685 3" Format="HDF">resultats_sans_regularisation.h5:/Function/u_warp/0</DataItem>
         </Attribute>
       </Grid>
     </Grid>
@@ -33,7 +33,7 @@
         <xi:include xpointer="xpointer(/Xdmf/Domain/Grid[@GridType='Uniform'][1]/*[self::Topology or self::Geometry])" />
         <Time Value="0" />
         <Attribute Name="von_mises" AttributeType="Scalar" Center="Node">
-          <DataItem Dimensions="9143 1" Format="HDF">resultats_sans_regularisation.h5:/Function/von_mises/0</DataItem>
+          <DataItem Dimensions="4685 1" Format="HDF">resultats_sans_regularisation.h5:/Function/von_mises/0</DataItem>
         </Attribute>
       </Grid>
     </Grid>
@@ -42,7 +42,7 @@
         <xi:include xpointer="xpointer(/Xdmf/Domain/Grid[@GridType='Uniform'][1]/*[self::Topology or self::Geometry])" />
         <Time Value="0" />
         <Attribute Name="u_r" AttributeType="Scalar" Center="Node">
-          <DataItem Dimensions="9143 1" Format="HDF">resultats_sans_regularisation.h5:/Function/u_r/0</DataItem>
+          <DataItem Dimensions="4685 1" Format="HDF">resultats_sans_regularisation.h5:/Function/u_r/0</DataItem>
         </Attribute>
       </Grid>
     </Grid>
@@ -51,7 +51,7 @@
         <xi:include xpointer="xpointer(/Xdmf/Domain/Grid[@GridType='Uniform'][1]/*[self::Topology or self::Geometry])" />
         <Time Value="0" />
         <Attribute Name="u_z" AttributeType="Scalar" Center="Node">
-          <DataItem Dimensions="9143 1" Format="HDF">resultats_sans_regularisation.h5:/Function/u_z/0</DataItem>
+          <DataItem Dimensions="4685 1" Format="HDF">resultats_sans_regularisation.h5:/Function/u_z/0</DataItem>
         </Attribute>
       </Grid>
     </Grid>
@@ -60,7 +60,7 @@
         <xi:include xpointer="xpointer(/Xdmf/Domain/Grid[@GridType='Uniform'][1]/*[self::Topology or self::Geometry])" />
         <Time Value="0" />
         <Attribute Name="J" AttributeType="Scalar" Center="Cell">
-          <DataItem Dimensions="18014 1" Format="HDF">resultats_sans_regularisation.h5:/Function/J/0</DataItem>
+          <DataItem Dimensions="9185 1" Format="HDF">resultats_sans_regularisation.h5:/Function/J/0</DataItem>
         </Attribute>
       </Grid>
     </Grid>
@@ -69,7 +69,7 @@
         <xi:include xpointer="xpointer(/Xdmf/Domain/Grid[@GridType='Uniform'][1]/*[self::Topology or self::Geometry])" />
         <Time Value="0" />
         <Attribute Name="von_mises_dg0" AttributeType="Scalar" Center="Cell">
-          <DataItem Dimensions="18014 1" Format="HDF">resultats_sans_regularisation.h5:/Function/von_mises_dg0/0</DataItem>
+          <DataItem Dimensions="9185 1" Format="HDF">resultats_sans_regularisation.h5:/Function/von_mises_dg0/0</DataItem>
         </Attribute>
       </Grid>
     </Grid>
