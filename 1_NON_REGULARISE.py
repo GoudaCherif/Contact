@@ -43,13 +43,14 @@ E_z       = 1352.0
 nu_rtheta = 0.3
 nu_rz     = 0.3
 G_rz      = 399.0
+nu_zr     = nu_rz * E_z / E_r
 E_2       = 113000.0
 nu_2      = 0.3
 gamma     = 1e-4
 mu_m      = 1.0
 u_imposed = -1.7
 n_steps   = 20
-warp_factor = 1
+warp_factor = 1.7
 
 #  Espace P1 
 V = fem.functionspace(domain, ("Lagrange", 1, (2,)))
@@ -70,28 +71,12 @@ def deformation_gradient_axi(u, r):
         [F_2d[1,0], 0,    F_2d[1,1]]
     ])
 
-# --- Déformation de cisaillement r-z : deux conventions, deux noms explicites ---
-# eps_rz_tensor      : composante TENSORIELLE ε_rz = (1/2)(∂u_r/∂z + ∂u_z/∂r)
-#                       -> à utiliser partout où une formule attend un tenseur
-#                          (invariants, J2, distorsion, cercle de Mohr, etc.)
-# gamma_rz_engineering : déformation INGENIEUR γ_rz = 2 ε_rz
-#                       -> à utiliser dans strain_axi, en accord avec la
-#                          convention de Voigt adoptée pour C_isotrope /
-#                          C_transverse_isotrope (diagonale de cisaillement
-#                          = G, pas 2G ; voir document "Loi de comportement
-#                          explicite", §2.4, Option A).
-def eps_rz_tensor(u):
-    return 0.5 * (u[0].dx(1) + u[1].dx(0))
-
-def gamma_rz_engineering(u):
-    return 2 * eps_rz_tensor(u)
-
 def strain_axi(u, r):
     return ufl.as_vector([
         u[0].dx(0),
         u[0] / r,
         u[1].dx(1),
-        gamma_rz_engineering(u)
+        0.5 * (u[0].dx(1) + u[1].dx(0)) * 2
     ])
 
 def C_isotrope(E, nu):
@@ -347,7 +332,7 @@ print(f"Cellule J_max — centre : r={jmax_center[0]:.3f} mm, "
 eps_rr_expr = u[0].dx(0)
 eps_tt_expr = u[0] / r
 eps_zz_expr = u[1].dx(1)
-eps_rz_expr = eps_rz_tensor(u)   # ε_rz tensorielle — cf. définition explicite plus haut
+eps_rz_expr = 0.5 * (u[0].dx(1) + u[1].dx(0))
 
 eps_rr_field = fem.Function(W0)
 eps_tt_field = fem.Function(W0)

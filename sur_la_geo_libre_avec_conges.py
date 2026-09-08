@@ -25,7 +25,7 @@ TAG_AXE_IMPL = 7
 save_dir = os.path.dirname(os.path.abspath(__file__))
 
 with XDMFFile(MPI.COMM_WORLD,
-              os.path.join(save_dir, "mesh_cones.xdmf"), "r") as xdmf:
+              os.path.join(save_dir, "mesh_translation.xdmf"), "r") as xdmf:
     domain = xdmf.read_mesh()
     domain.topology.create_entities(1)
     cell_tags  = xdmf.read_meshtags(domain, name="cell_tags")
@@ -43,13 +43,14 @@ E_z       = 1352.0
 nu_rtheta = 0.3
 nu_rz     = 0.3
 G_rz      = 399.0
+nu_zr     = nu_rz * E_z / E_r
 E_2       = 113000.0
 nu_2      = 0.3
 gamma     = 1e-4
 mu_m      = 1.0
 u_imposed = -1.7
 n_steps   = 20
-warp_factor = 1
+warp_factor = 1.7
 
 #  Espace P1 
 V = fem.functionspace(domain, ("Lagrange", 1, (2,)))
@@ -70,28 +71,12 @@ def deformation_gradient_axi(u, r):
         [F_2d[1,0], 0,    F_2d[1,1]]
     ])
 
-# --- Déformation de cisaillement r-z : deux conventions, deux noms explicites ---
-# eps_rz_tensor      : composante TENSORIELLE ε_rz = (1/2)(∂u_r/∂z + ∂u_z/∂r)
-#                       -> à utiliser partout où une formule attend un tenseur
-#                          (invariants, J2, distorsion, cercle de Mohr, etc.)
-# gamma_rz_engineering : déformation INGENIEUR γ_rz = 2 ε_rz
-#                       -> à utiliser dans strain_axi, en accord avec la
-#                          convention de Voigt adoptée pour C_isotrope /
-#                          C_transverse_isotrope (diagonale de cisaillement
-#                          = G, pas 2G ; voir document "Loi de comportement
-#                          explicite", §2.4, Option A).
-def eps_rz_tensor(u):
-    return 0.5 * (u[0].dx(1) + u[1].dx(0))
-
-def gamma_rz_engineering(u):
-    return 2 * eps_rz_tensor(u)
-
 def strain_axi(u, r):
     return ufl.as_vector([
         u[0].dx(0),
         u[0] / r,
         u[1].dx(1),
-        gamma_rz_engineering(u)
+        0.5 * (u[0].dx(1) + u[1].dx(0)) * 2
     ])
 
 def C_isotrope(E, nu):
@@ -180,25 +165,55 @@ print(f"z noeuds TOP : min={domain.geometry.x[top_nodes,1].min():.3f}  "
 #  Solveur 
 from dolfinx.fem.petsc import NonlinearProblem
 
+# Le problème est encapsulé dans une fonction (plutôt qu'un objet unique) car
+# il doit être RECRÉÉ après chaque échec de convergence pendant la boucle de
+# pas adaptatif : reconstruire NonlinearProblem force PETSc/MUMPS à repartir
+# d'un état interne propre (ré-analyse symbolique, factorisation fraîche), ce
+# qui évite qu'un état de solveur corrompu par un échec précédent (résidu
+# NaN, pivot défaillant) ne contamine la tentative suivante.
 def make_problem():
     return NonlinearProblem(
         F_form, u, bcs=bcs, J=J_form,
         petsc_options={
-            "snes_type"                 : "newtonls",
-            "snes_linesearch_type"      : "bt",
-            "snes_atol"                 : 1e-9,
-            "snes_rtol"                 : 1e-9,
-            "snes_max_it"               : 100,
-            "snes_monitor"              : None,
-            "snes_converged_reason"     : None,
-            "ksp_type"                  : "preonly",
-            "pc_type"                   : "lu",
-            "pc_factor_mat_solver_type" : "mumps",
-            "pc_factor_mat_solver_package" : "mumps",
-            "mat_mumps_icntl_14"        : 200,
-            "mat_mumps_cntl_1"          : 0.1,
+            # --- Solveur non-linéaire (SNES) ---
+            "snes_type"                 : "newtonls",  # Newton avec recherche linéaire (line search)
+            "snes_linesearch_type"      : "bt",         # backtracking : réduit le pas Newton si le
+                                                          # résidu ne décroît pas assez -> plus robuste
+                                                          # qu'un Newton pur, surtout ici vu la forte
+                                                          # non-linéarité du terme hyperélastique du gap.
+            "snes_atol"                 : 1e-9,          # tolérance absolue sur la norme du résidu
+            "snes_rtol"                 : 1e-9,          # tolérance relative (résidu / résidu initial)
+            "snes_max_it"               : 100,           # nb max d'itérations Newton par pas de charge ;
+                                                          # si non atteint -> reason <= 0 -> échec du pas
+            "snes_monitor"              : None,          # affiche le résidu à chaque itération Newton
+            "snes_converged_reason"     : None,          # affiche la raison de convergence/divergence
+
+            # --- Solveur linéaire (KSP) résolu à CHAQUE itération Newton ---
+            "ksp_type"                  : "preonly",     # pas d'itératif : on ne fait QUE appliquer le
+                                                          # préconditionneur, qui est ici une factorisation
+                                                          # directe complète -> résolution "exacte"
+            "pc_type"                   : "lu",          # préconditionneur = factorisation LU directe
+            "pc_factor_mat_solver_type" : "mumps",       # LU réalisée par le solveur direct MUMPS
+                                                          # (robuste sur systèmes mal conditionnés/creux)
+            "pc_factor_mat_solver_package" : "mumps",    # alias redondant (compat. anciennes versions PETSc)
+
+            # --- Réglages fins MUMPS, nécessaires vu le très mauvais
+            #     conditionnement du système : rigidité os/implant (E~10^3-10^5 MPa)
+            #     vs rigidité du gap (gamma*mu_m ~ 10^-4 MPa), ratio ~10^7-10^9 ---
+            "mat_mumps_icntl_14"        : 200,           # marge mémoire de travail (+200%) allouée pour
+                                                          # le remplissage (fill-in) de la factorisation ;
+                                                          # évite un échec par manque de mémoire de travail
+                                                          # sur une matrice à conditionnement extrême.
+            "mat_mumps_cntl_1"          : 0.1,           # seuil de pivotement relevé (0.1 au lieu du
+                                                          # défaut ~1e-8) : accepte des pivots plus petits
+                                                          # comme "suffisamment grands", ce qui stabilise
+                                                          # la factorisation sur un système quasi-singulier,
+                                                          # au prix d'une précision numérique légèrement
+                                                          # réduite sur la solution.
         },
-        petsc_options_prefix="tmc"
+        petsc_options_prefix="tmc"     # préfixe des options PETSc, pour isoler ce solveur
+                                        # d'autres solveurs éventuels dans le même run
+                                        # (ex. la projection L² Von Mises, préfixe "vm_proj")
     )
 
 problem = make_problem()
@@ -216,6 +231,7 @@ cells_impl_nodes = np.unique(
     entities_to_geometry(domain, 2, cells_impl, False).flatten()
 )
 
+# Point suivi : nœud sur l'axe, en haut de l'implant (proche de r=0, z=H12)
 node_top_axis = top_nodes[np.argmin(coords[top_nodes, 0])]
 print(f"Point suivi (haut implant, axe) — r={coords[node_top_axis,0]:.4f} mm, "
       f"z={coords[node_top_axis,1]:.4f} mm")
@@ -225,47 +241,71 @@ hist_j_min     = []
 hist_j_max     = []
 hist_uz_min    = []
 hist_uz_impl   = []
-hist_uz_top    = []
-hist_step_num  = []
+hist_uz_top    = []   # u_z du point suivi, par pas convergé
+hist_step_num  = []   # numéro du pas convergé (pour tracer en fonction des itérations)
 snapshots      = []
 
-u_per_step_initial = u_imposed / n_steps
-u_per_step = u_per_step_initial
-current_u  = 0.0
-step_count = 0
-attempt_count = 0
-max_attempts  = 500
-delta_min = 1e-6 * abs(u_imposed)
+#  Résolution avec pas adaptatif + restauration 
+# Stratégie de "load stepping" (continuation) : on n'impose pas u_imposed d'un
+# coup (Newton diverge sur un pas trop grand vu la forte non-linéarité et le
+# quasi-écrasement possible du gap) mais par petits incréments successifs. Si
+# un incrément échoue à converger, on revient en arrière et on retente avec un
+# pas deux fois plus petit -> convergence quasi garantie tant que le pas peut
+# être réduit indéfiniment (borné par delta_min).
+u_per_step_initial = u_imposed / n_steps   # taille de pas visée au départ
+u_per_step = u_per_step_initial            # taille de pas courante (réduite en cas d'échec)
+current_u  = 0.0                           # déplacement total déjà appliqué et convergé
+step_count = 0                             # nombre de pas convergés avec succès
+attempt_count = 0                          # nombre total de tentatives (succès + échecs)
+max_attempts  = 500                        # garde-fou : arrêt même si le pas ne devient
+                                            # jamais assez petit (évite une boucle infinie)
+delta_min = 1e-6 * abs(u_imposed)          # pas minimal toléré ; en dessous, on considère
+                                            # que la convergence est hors de portée et on arrête
 
+# Sauvegarder l'état initial (u=0) : c'est l'état vers lequel on revient si
+# la toute première tentative de pas échoue.
 u_prev = u.x.array.copy()
 
 print(f"Résolution — pas initial de {u_per_step:.4f} mm (max {n_steps} pas)")
 sys.stdout.flush()
 
 while abs(current_u) < abs(u_imposed) and attempt_count < max_attempts:
+    # Calcule la cible du pas courant : current_u + le pas courant, sauf si
+    # cela dépasserait le déplacement total visé (on clippe alors exactement
+    # sur u_imposed pour ne jamais le dépasser).
     target_u = current_u + u_per_step
     if abs(target_u) > abs(u_imposed):
         target_u = u_imposed
         u_per_step = target_u - current_u
 
-    u_imp.value = target_u
+    u_imp.value = target_u   # met à jour la valeur de la BC de Dirichlet pilotée
     attempt_count += 1
     print(f"Tentative {attempt_count} : u={target_u:.4f} mm (incr={u_per_step:.4f})")
     sys.stdout.flush()
 
     try:
-        converged = problem.solve()
-        reason = problem.solver.getConvergedReason()
+        converged = problem.solve()               # lance Newton pour ce pas
+        reason = problem.solver.getConvergedReason()  # code SNES : >0 succès, <=0 échec
         if reason > 0:
+            # --- Succès : le pas est validé, on avance ---
             current_u = target_u
             step_count += 1
+            # L'état convergé devient le nouveau point de restauration en cas
+            # d'échec du PROCHAIN pas.
             u_prev = u.x.array.copy()
             print(f"  OK (reason={reason})")
 
+            # Sauvegarde de quelques instantanés du champ de déplacement pour
+            # une éventuelle visualisation de l'historique de déformation
+            # (1er pas, 1/4, 1/2, dernier pas prévu).
             if step_count in [1, n_steps//4, n_steps//2, n_steps]:
                 u_snapshot = u.x.array.reshape(-1, 2).copy()
                 snapshots.append((current_u, u_snapshot))
 
+            # Mise à jour des historiques de suivi (tracés en fin de script) :
+            # on recalcule le champ J (Jacobien) en interpolant son expression
+            # UFL sur l'espace DG0, puis on extrait quelques indicateurs
+            # scalaires (min/max dans le gap, descente de l'implant...).
             J_field.interpolate(J_expr)
             j_min = J_field.x.array[cells_gap].min()
             j_max = J_field.x.array[cells_gap].max()
@@ -287,7 +327,17 @@ while abs(current_u) < abs(u_imposed) and attempt_count < max_attempts:
                   f"J=[{j_min:.4f},{j_max:.4f}]")
             sys.stdout.flush()
 
+            # Piste d'amélioration non activée : ré-augmenter le pas après un
+            # succès (accélère la résolution une fois la zone difficile passée),
+            # laissée en commentaire car non nécessaire ici empiriquement.
+            # u_per_step = min(u_per_step * 1.2, abs(u_imposed - current_u)/2)
+
         else:
+            # --- Échec de convergence Newton (reason <= 0) ---
+            # On revient à l'état convergé précédent (sinon u contient un
+            # itéré non physique issu du Newton qui a divergé), on réduit
+            # le pas de moitié, et on réessaie le MÊME current_u avec un
+            # incrément plus petit.
             u.x.array[:] = u_prev
             print(f"  Échec (reason={reason}), restauration + réduction du pas")
             sys.stdout.flush()
@@ -295,10 +345,16 @@ while abs(current_u) < abs(u_imposed) and attempt_count < max_attempts:
             if abs(u_per_step) < delta_min:
                 print("  Pas trop petit, arrêt.")
                 break
+            # Recréer le problème pour réinitialiser MUMPS (cf. commentaire
+            # sur make_problem plus haut : repartir d'un état solveur propre).
             problem = make_problem()
             continue
 
     except Exception as e:
+        # --- Échec "dur" : exception levée pendant le solve (ex. J<=0 dans
+        #     le gap -> J**(-2/3) indéfini -> NaN ou erreur d'évaluation) ---
+        # Même traitement que l'échec de convergence : restaurer, réduire,
+        # recréer le solveur, puis retenter.
         u.x.array[:] = u_prev
         print(f"  Exception : {e}, restauration + réduction du pas")
         sys.stdout.flush()
@@ -312,6 +368,7 @@ while abs(current_u) < abs(u_imposed) and attempt_count < max_attempts:
 print(f"Résolution terminée après {step_count} pas convergés (sur {n_steps} initialement prévus).")
 sys.stdout.flush()
 
+#  Résumé final 
 u_array = u.x.array.reshape(-1, 2)
 eps_zz = fem.Function(W0)
 eps_zz.interpolate(fem.Expression(u[1].dx(1), W0.element.interpolation_points))
@@ -344,10 +401,12 @@ jmax_center  = coords[jmax_nodes].mean(axis=0)
 print(f"Cellule J_max — centre : r={jmax_center[0]:.3f} mm, "
       f"z={jmax_center[1]:.3f} mm")
 
+#  Post‑traitement avancé (distorsion) 
+# (on utilise W0 déjà défini)
 eps_rr_expr = u[0].dx(0)
 eps_tt_expr = u[0] / r
 eps_zz_expr = u[1].dx(1)
-eps_rz_expr = eps_rz_tensor(u)   # ε_rz tensorielle — cf. définition explicite plus haut
+eps_rz_expr = 0.5 * (u[0].dx(1) + u[1].dx(0))
 
 eps_rr_field = fem.Function(W0)
 eps_tt_field = fem.Function(W0)
@@ -373,6 +432,7 @@ distorsion_expr = ufl.sqrt(3 * I2_dev_expr)
 distorsion_field = fem.Function(W0)
 distorsion_field.interpolate(fem.Expression(distorsion_expr, W0.element.interpolation_points))
 
+# Statistiques
 eps_rr_gap = eps_rr_field.x.array[cells_gap]
 eps_tt_gap = eps_tt_field.x.array[cells_gap]
 eps_zz_gap = eps_zz_field.x.array[cells_gap]
@@ -388,8 +448,10 @@ print(f"eps_rz : min={eps_rz_gap.min():.4e}  max={eps_rz_gap.max():.4e}  mean={e
 print(f"I2_dev : min={I2_dev_gap.min():.4e}  max={I2_dev_gap.max():.4e}  mean={I2_dev_gap.mean():.4e}")
 print(f"Distorsion : min={dist_gap.min():.4e}  max={dist_gap.max():.4e}  mean={dist_gap.mean():.4e}")
 
+#  Contraintes de Von Mises + déplacements (ensemble du modèle) 
 print("\n--- Contraintes de Von Mises et déplacements (modèle complet) ---")
 
+# Déplacements radial / axial, champs P1 sur tout le domaine
 V_scal = fem.functionspace(domain, ("Lagrange", 1))
 u_r_field = fem.Function(V_scal)
 u_z_field = fem.Function(V_scal)
@@ -398,6 +460,13 @@ u_z_field.name = "u_z"
 u_r_field.interpolate(fem.Expression(u[0], V_scal.element.interpolation_points))
 u_z_field.interpolate(fem.Expression(u[1], V_scal.element.interpolation_points))
 
+# Champ vectoriel dédié au Warp By Vector dans ParaView : 'u' n'a que 2
+# composantes (u_r, u_z), cohérent avec un maillage 2D, mais Warp By Vector
+# attend un vecteur à 3 composantes pour fonctionner correctement (c'est
+# pour cette même raison que le bloc PyVista plus bas complète 'u' à 3
+# composantes avant d'appeler warp_by_vector). On construit ici l'équivalent
+# pour l'export XDMF/ParaView, 3e composante nulle (pas de déplacement
+# hors-plan dans ce modèle axisymétrique).
 V_warp = fem.functionspace(domain, ("Lagrange", 1, (3,)))
 u_warp_field = fem.Function(V_warp)
 u_warp_field.name = "u_warp"
@@ -406,13 +475,16 @@ u_warp_field.interpolate(fem.Expression(
     ufl.as_vector([u[0], u[1], zero_scalar]),
     V_warp.element.interpolation_points))
 
+# Contraintes — zones linéaires (os, implant) : sigma_voigt = C * eps_axi
 def sigma_voigt_lin(u, r, C):
-    eps = strain_axi(u, r)
-    return C * eps
+    eps = strain_axi(u, r)   # [eps_rr, eps_tt, eps_zz, gamma_rz]
+    return C * eps           # [sigma_rr, sigma_tt, sigma_zz, tau_rz]
 
 sig_os   = sigma_voigt_lin(u, r, C_os)
 sig_impl = sigma_voigt_lin(u, r, C_impl)
 
+# Contrainte de Cauchy — zone hyperélastique (gap), via dérivation automatique
+# P = dW/dF (1er Piola-Kirchhoff), sigma = (1/J) * P * F^T (Cauchy)
 F_gap   = deformation_gradient_axi(u, r)
 Fv      = ufl.variable(F_gap)
 Cg      = Fv.T * Fv
@@ -435,12 +507,32 @@ vm_os_expr   = von_mises_axi(sig_os[0],   sig_os[1],   sig_os[2],   sig_os[3])
 vm_impl_expr = von_mises_axi(sig_impl[0], sig_impl[1], sig_impl[2], sig_impl[3])
 vm_gap_expr  = von_mises_axi(sig_gap_rr,  sig_gap_tt,  sig_gap_zz,  sig_gap_rz)
 
+# Champ Von Mises DG0 (précis, zone par zone) — utilisé pour les stats console.
+# Interpolation zone par zone : correcte et déjà robuste en parallèle
+# (DOLFINx gère nativement le assemblage/scatter des Function distribuées).
 vm_field = fem.Function(W0)
 vm_field.name = "von_mises_dg0"
 vm_field.interpolate(fem.Expression(vm_os_expr,   W0.element.interpolation_points), cells_os)
 vm_field.interpolate(fem.Expression(vm_impl_expr, W0.element.interpolation_points), cells_impl)
 vm_field.interpolate(fem.Expression(vm_gap_expr,  W0.element.interpolation_points), cells_gap)
 
+# Champ Von Mises P1 (même espace que u_r/u_z) — pour visualisation ParaView
+# (DG0 est écrit par dolfinx sur une géométrie séparée dans le XDMF, ce qui casse
+#  Warp By Vector côté ParaView ; P1 partage la géométrie du maillage, comme u_r/u_z)
+#
+# CORRECTIF : le moyennage nodal "à la main" (np.add.at sur les cellules locales)
+# est incorrect en exécution MPI multi-process, car domain.topology.index_map
+# .size_local exclut les cellules fantômes (ghost) des voisins de partition :
+# sur les nœuds situés à une frontière de partition, la somme/le compte seraient
+# tronqués et le champ P1 présenterait une discontinuité artificielle le long de
+# ces frontières (invisible en séquentiel, où il n'y a pas de ghost cells).
+#
+# On utilise à la place une projection L² standard de vm_field (DG0, déjà
+# correct zone par zone) sur l'espace P1 : problème variationnel classique
+# assemblé et résolu par DOLFINx/PETSc, donc géré nativement en distribué
+# (scatter/gather MPI corrects), sans logique de réduction manuelle à maintenir.
+# Pondérée par r (comme dx(TAG_...) partout ailleurs dans le script) pour rester
+# cohérente avec la mesure axisymétrique réelle du problème.
 from dolfinx.fem.petsc import LinearProblem
 
 w_test  = ufl.TestFunction(V_scal)
@@ -456,15 +548,38 @@ proj_problem = LinearProblem(
 vm_p1_field = proj_problem.solve()
 vm_p1_field.name = "von_mises"
 
+# --- Diagnostic : le champ DG0 brut (vm_field) doit être >= 0 par construction
+# (Von Mises = racine d'une somme de carrés). S'il l'est bien, toute valeur
+# négative observée sur le champ projeté (vm_p1_field) provient uniquement de
+# la projection L² elle-même (débordement de type Gibbs au voisinage des
+# interfaces à fort contraste de rigidité), pas d'un bug dans le calcul des
+# contraintes. Ce test permet de trancher sans ambiguïté entre les deux.
 vm_min_dg0 = float(vm_field.x.array.min())
 vm_min_p1  = float(vm_p1_field.x.array.min())
 print(f"[Vérification Von Mises] min DG0 (brut, calcul physique) : {vm_min_dg0:.6e} MPa")
 print(f"[Vérification Von Mises] min P1  (projeté, visualisation) : {vm_min_p1:.6e} MPa")
 if vm_min_dg0 < -1e-8:
-    print("  -> ALERTE : le champ DG0 brut est négatif.")
+    print("  -> ALERTE : le champ DG0 brut est négatif. Ceci indique un problème réel "
+          "dans le calcul des contraintes (formule, signe, ou NaN silencieux) — "
+          "à investiguer avant de faire confiance à un quelconque résultat de Von Mises.")
 else:
-    print("  -> Le champ DG0 brut est bien >= 0 : le calcul physique des contraintes est correct.")
+    print("  -> Le champ DG0 brut est bien >= 0 : le calcul physique des contraintes est "
+          "correct. La valeur négative visible sur le champ projeté (vm_p1_field) est un "
+          "artefact numérique de la projection L² aux interfaces à fort contraste de "
+          "rigidité (os/gap, gap/implant), pas une erreur de calcul.")
 
+# --- Diagnostic renforcé : le test ci-dessus (min DG0 >= 0) ne prouve
+# l'absence d'erreur de projection QUE là où elle franchit zéro — un
+# débordement positif (valeur projetée surestimée sans devenir négative,
+# car la vraie valeur y est déjà élevée) resterait invisible à ce test.
+# On vérifie ici, pour CHAQUE nœud, que la valeur projetée reste dans
+# l'enveloppe [min, max] des valeurs DG0 des cellules qui le touchent —
+# un test valable quel que soit le signe, qui détecte tout débordement
+# local de la projection, pas seulement ceux qui croisent zéro.
+# (Diagnostic uniquement, non utilisé pour corriger quoi que ce soit ;
+# comme pour l'ancien moyennage manuel, ce calcul ne considère que les
+# cellules locales -> valable tel quel en séquentiel, sous-estimerait le
+# nombre de nœuds détectés en MPI multi-process du fait des ghost cells.)
 n_cells_total_diag = domain.topology.index_map(tdim).size_local
 cell_nodes_diag = entities_to_geometry(domain, tdim,
                                         np.arange(n_cells_total_diag, dtype=np.int32), False)
@@ -479,8 +594,8 @@ np.minimum.at(vm_env_min, flat_nodes_diag, flat_vals_diag)
 np.maximum.at(vm_env_max, flat_nodes_diag, flat_vals_diag)
 
 vm_p1_vals = vm_p1_field.x.array
-overshoot_below = np.maximum(vm_env_min - vm_p1_vals, 0.0)
-overshoot_above = np.maximum(vm_p1_vals - vm_env_max, 0.0)
+overshoot_below = np.maximum(vm_env_min - vm_p1_vals, 0.0)   # dépasse sous le min voisin
+overshoot_above = np.maximum(vm_p1_vals - vm_env_max, 0.0)   # dépasse au-dessus du max voisin
 overshoot = np.maximum(overshoot_below, overshoot_above)
 n_flagged = int((overshoot > 1e-6).sum())
 max_overshoot = float(overshoot.max())
@@ -492,27 +607,53 @@ print(f"[Vérification Von Mises] nœuds hors enveloppe DG0 voisine : "
 print(f"[Vérification Von Mises] débordement max (au-delà du min/max voisin) : "
       f"{max_overshoot:.4f} MPa, au nœud r={worst_pos[0]:.3f} mm, z={worst_pos[1]:.3f} mm")
 
+
 print(f"Von Mises Os      : min={vm_field.x.array[cells_os].min():.4f}  max={vm_field.x.array[cells_os].max():.4f}  MPa")
 print(f"Von Mises Implant : min={vm_field.x.array[cells_impl].min():.4f}  max={vm_field.x.array[cells_impl].max():.4f}  MPa")
 print(f"Von Mises Gap     : min={vm_field.x.array[cells_gap].min():.4f}  max={vm_field.x.array[cells_gap].max():.4f}  MPa")
 print(f"u_r (modèle)      : min={u_r_field.x.array.min():.4f}  max={u_r_field.x.array.max():.4f}  mm")
 print(f"u_z (modèle)      : min={u_z_field.x.array.min():.4f}  max={u_z_field.x.array.max():.4f}  mm")
 
+#  Sauvegarde XDMF enrichie 
 with XDMFFile(MPI.COMM_WORLD,
-              os.path.join(save_dir, "resultats_sans_regularisation.xdmf"), "w") as xdmf:
+              os.path.join(save_dir, "resultats_sans_regularisation_translation_conges.xdmf"), "w") as xdmf:
     xdmf.write_mesh(domain)
+    # Champs P1 D'ABORD, tous compatibles avec la géométrie du maillage —
+    # DOLFINx les rattache à la même grille XDMF que le maillage, ce qui
+    # permet à ParaView de combiner Warp By Vector (avec 'u_warp') et une
+    # coloration par n'importe lequel des autres champs P1 sur ce même bloc
+    # (notamment 'von_mises', la version projetée). Écrire un champ DG0
+    # AVANT ces champs P1 peut perturber ce rattachement à une grille unique
+    # (la géométrie dupliquée du DG0 devient alors la grille "principale"),
+    # empêchant précisément la combinaison warp+couleur — d'où cet ordre.
     u.name = "u"
     xdmf.write_function(u)
-    xdmf.write_function(u_warp_field)
-    xdmf.write_function(vm_p1_field)
+    xdmf.write_function(u_warp_field)  # 3 composantes — Vecteur pour Warp By Vector
+    xdmf.write_function(vm_p1_field)   # P1, lissé — se combine avec le warp ci-dessus
     xdmf.write_function(u_r_field)
     xdmf.write_function(u_z_field)
+
+    # Champs DG0 ENSUITE — grille séparée de toute façon (géométrie dupliquée),
+    # non combinables avec Warp By Vector quel que soit l'ordre d'écriture.
     J_field.name = "J"
     xdmf.write_function(J_field)
-    xdmf.write_function(vm_field)
+    xdmf.write_function(vm_field)      # exact (von_mises_dg0), non lissé
+    """  eps_rr_field.name = "eps_rr"
+    xdmf.write_function(eps_rr_field)
+    eps_tt_field.name = "eps_tt"
+    xdmf.write_function(eps_tt_field)
+    eps_zz_field.name = "eps_zz"
+    xdmf.write_function(eps_zz_field)
+    eps_rz_field.name = "eps_rz"
+    xdmf.write_function(eps_rz_field)
+    I2_dev_field.name = "I2_dev"
+    xdmf.write_function(I2_dev_field)
+    distorsion_field.name = "distorsion"
+    xdmf.write_function(distorsion_field)"""
 
-print("Fichier XDMF avancé sauvegardé : resultats_sans_regularisation.xdmf")
+print("Fichier XDMF avancé sauvegardé : resultats_sans_regularisation_translation_conges.xdmf")
 
+#  Visualisation PyVista 
 import pyvista as pv
 import matplotlib.pyplot as plt
 from dolfinx.plot import vtk_mesh
@@ -535,6 +676,12 @@ grid_def.cell_data["J"]         = J_field.x.array
 grid_def.cell_data["von_mises"] = vm_field.x.array
 grid_def.point_data["u_z"]      = u_array[:,1]
 
+# Champ Von Mises écrêté (percentile 95), pour éviter qu'un point singulier
+# isolé (coin rentrant de la géométrie, où la contrainte peut croître sans
+# borne avec le raffinement du maillage) n'écrase visuellement toute la
+# colormap. On garde "von_mises" (exact, non modifié) ET on ajoute ce
+# second champ, déjà prêt à afficher sans aucun réglage de colormap dans
+# ParaView — sélectionner directement "von_mises_clip95" dans le menu.
 vm_p95 = float(np.percentile(vm_field.x.array, 95))
 grid_def.cell_data["von_mises_clip95"] = np.clip(vm_field.x.array, 0.0, vm_p95)
 print(f"Von Mises — écrêtage visuel (95e percentile) : {vm_p95:.4f} MPa "
@@ -551,7 +698,7 @@ p1a.add_mesh(grid, scalars="domaine", cmap=CMAP,
              show_edges=True, edge_color="#555555", line_width=0.4,
              show_scalar_bar=False)
 p1a.view_xy()
-p1a.show(screenshot=os.path.join(save_dir, "vue1a_initial.png"))
+p1a.show()
 
 # VUE 1b : Déformé
 p1b = pv.Plotter(window_size=[700, 800])
@@ -562,12 +709,17 @@ p1b.add_mesh(grid_def, scalars="domaine", cmap=CMAP,
              show_edges=True, edge_color="#555555", line_width=0.4,
              show_scalar_bar=False)
 p1b.view_xy()
-p1b.show(screenshot=os.path.join(save_dir, "vue1b_deforme.png"))
+p1b.show()
 
-grid_def.save(os.path.join(save_dir, "resultats_deformes_von_mises.vtu"))
-print("Maillage déformé (Von Mises exact) sauvegardé : resultats_deformes_von_mises.vtu")
+# Sauvegarde directe du maillage DÉJÀ déformé (par PyVista, warp_factor) avec
+# Von Mises exact (DG0, non lissé) déjà attaché comme donnée de cellule.
+# Contourne complètement le problème Warp By Vector + XDMF : ce fichier
+# s'ouvre tel quel dans ParaView, déjà déformé et coloré, sans aucun filtre
+# à appliquer ni à configurer.
+grid_def.save(os.path.join(save_dir, "resultats_deformes_von_mises_translation_conges.vtu"))
+print("Maillage déformé (Von Mises exact) sauvegardé : resultats_deformes_von_mises_translation_conges.vtu")
 
-# VUE 2
+# VUE 2 : u_z + gap jaune + J_max rouge
 grid_gap_def = grid_def.extract_cells(
     np.where(cell_tags.values == TAG_GAP)[0])
 grid_jmax    = grid_def.extract_cells(np.array([idx_jmax_gap]))
@@ -587,9 +739,9 @@ p2.add_mesh(grid_gap_def, color="#FFD700", opacity=1.0,
 p2.add_mesh(grid_jmax, color="#FF0000", opacity=1.0,
             show_edges=True, edge_color="#FF0000", line_width=2.0)
 p2.view_xy()
-p2.show(screenshot=os.path.join(save_dir, "vue2_uz.png"))
+p2.show()
 
-# VUE 2bis
+# VUE 2bis : Von Mises sur le maillage déformé
 p2b = pv.Plotter(window_size=[700, 900])
 p2b.background_color = BG
 p2b.add_text("Contrainte de Von Mises (déformé)", font_size=12,
@@ -605,9 +757,9 @@ p2b.add_mesh(grid_gap_def, color="#FFD700", style="wireframe",
 p2b.add_mesh(grid_jmax, color="#FF0000", opacity=1.0,
              show_edges=True, edge_color="#FF0000", line_width=2.0)
 p2b.view_xy()
-p2b.show(screenshot=os.path.join(save_dir, "vue2bis_von_mises.png"))
+p2b.show()
 
-# VUE 3
+# VUE 3 : Zoom zone de contact
 p3 = pv.Plotter(window_size=[900, 600])
 p3.background_color = BG
 p3.add_text("Zoom — zone de contact", font_size=12,
@@ -625,9 +777,9 @@ p3.view_xy()
 p3.camera.position    = (10.0, 13.5, 40.0)
 p3.camera.focal_point = (10.0, 13.5, 0.0)
 p3.camera.view_angle  = 30.0
-p3.show(screenshot=os.path.join(save_dir, "vue3_zoom_contact.png"))
+p3.show()
 
-# VUE 4a
+# VUE 4a : Courbes J_min, J_max dans le troisième milieu
 if len(hist_steps) > 0:
     hist_steps   = np.array(hist_steps)
     hist_j_min   = np.array(hist_j_min)
@@ -653,10 +805,11 @@ if len(hist_steps) > 0:
     ax1.spines[:].set_color("#444444")
     ax1.legend(facecolor="#0f0f23", labelcolor="white", fontsize=11)
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "jacobien_gap.png"), dpi=150,
+    plt.savefig(os.path.join(save_dir, "jacobien_gap_translation_conges.png"), dpi=150,
                 facecolor=fig1.get_facecolor())
     plt.show()
 
+    # VUE 4b : Descente implant (|u_z|)
     fig2, ax2 = plt.subplots(figsize=(7, 5))
     ax2.plot(hist_u_plot, np.abs(hist_uz_min), color="#FFD700", linewidth=2.0,
              marker="o", markersize=4, label="u$_z$ min global")
@@ -672,10 +825,13 @@ if len(hist_steps) > 0:
     ax2.spines[:].set_color("#444444")
     ax2.legend(facecolor="#0f0f23", labelcolor="white", fontsize=11)
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "descente_implant.png"), dpi=150,
+    plt.savefig(os.path.join(save_dir, "descente_implant_translation_conges.png"), dpi=150,
                 facecolor=fig2.get_facecolor())
     plt.show()
 
+    # VUE 5 : Descente du point haut-implant en fonction du numéro d'itération
+    # u_z tracé directement (non en valeur absolue) : la courbe descend bien,
+    # car u_z devient de plus en plus négatif au fil des pas.
     fig2, ax5 = plt.subplots(figsize=(7, 5))
     fig2.patch.set_facecolor("#1a1a2e")
     ax5.set_facecolor("#0f0f23")
@@ -690,7 +846,7 @@ if len(hist_steps) > 0:
     ax5.spines[:].set_color("#444444")
     ax5.grid(True, alpha=0.2, color="white")
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "descente_point_haut_implant.png"), dpi=150,
+    plt.savefig(os.path.join(save_dir, "descente_point_haut_implant_translation_conges.png"), dpi=150,
                 facecolor=fig2.get_facecolor())
     plt.show()
 

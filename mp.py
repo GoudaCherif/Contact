@@ -43,13 +43,14 @@ E_z       = 1352.0
 nu_rtheta = 0.3
 nu_rz     = 0.3
 G_rz      = 399.0
+nu_zr     = nu_rz * E_z / E_r
 E_2       = 113000.0
 nu_2      = 0.3
 gamma     = 1e-4
 mu_m      = 1.0
 u_imposed = -1.7
 n_steps   = 20
-warp_factor = 1
+warp_factor = 1.7
 
 #  Espace P1 
 V = fem.functionspace(domain, ("Lagrange", 1, (2,)))
@@ -70,28 +71,12 @@ def deformation_gradient_axi(u, r):
         [F_2d[1,0], 0,    F_2d[1,1]]
     ])
 
-# --- Déformation de cisaillement r-z : deux conventions, deux noms explicites ---
-# eps_rz_tensor      : composante TENSORIELLE ε_rz = (1/2)(∂u_r/∂z + ∂u_z/∂r)
-#                       -> à utiliser partout où une formule attend un tenseur
-#                          (invariants, J2, distorsion, cercle de Mohr, etc.)
-# gamma_rz_engineering : déformation INGENIEUR γ_rz = 2 ε_rz
-#                       -> à utiliser dans strain_axi, en accord avec la
-#                          convention de Voigt adoptée pour C_isotrope /
-#                          C_transverse_isotrope (diagonale de cisaillement
-#                          = G, pas 2G ; voir document "Loi de comportement
-#                          explicite", §2.4, Option A).
-def eps_rz_tensor(u):
-    return 0.5 * (u[0].dx(1) + u[1].dx(0))
-
-def gamma_rz_engineering(u):
-    return 2 * eps_rz_tensor(u)
-
 def strain_axi(u, r):
     return ufl.as_vector([
         u[0].dx(0),
         u[0] / r,
         u[1].dx(1),
-        gamma_rz_engineering(u)
+        0.5 * (u[0].dx(1) + u[1].dx(0)) * 2
     ])
 
 def C_isotrope(E, nu):
@@ -196,7 +181,7 @@ def make_problem():
             "pc_factor_mat_solver_type" : "mumps",
             "pc_factor_mat_solver_package" : "mumps",
             "mat_mumps_icntl_14"        : 200,
-            "mat_mumps_cntl_1"          : 0.1,
+            "mat_mumps_cntl_1"          : 0.1,   # seuil de pivotement (0.1 au lieu de 1e-12)
         },
         petsc_options_prefix="tmc"
     )
@@ -216,27 +201,23 @@ cells_impl_nodes = np.unique(
     entities_to_geometry(domain, 2, cells_impl, False).flatten()
 )
 
-node_top_axis = top_nodes[np.argmin(coords[top_nodes, 0])]
-print(f"Point suivi (haut implant, axe) — r={coords[node_top_axis,0]:.4f} mm, "
-      f"z={coords[node_top_axis,1]:.4f} mm")
-
 hist_steps     = []
 hist_j_min     = []
 hist_j_max     = []
 hist_uz_min    = []
 hist_uz_impl   = []
-hist_uz_top    = []
-hist_step_num  = []
 snapshots      = []
 
+#  Résolution avec pas adaptatif + restauration 
 u_per_step_initial = u_imposed / n_steps
 u_per_step = u_per_step_initial
-current_u  = 0.0
+current_u = 0.0
 step_count = 0
 attempt_count = 0
-max_attempts  = 500
+max_attempts = 500
 delta_min = 1e-6 * abs(u_imposed)
 
+# Sauvegarder l'état initial (u=0)
 u_prev = u.x.array.copy()
 
 print(f"Résolution — pas initial de {u_per_step:.4f} mm (max {n_steps} pas)")
@@ -257,37 +238,41 @@ while abs(current_u) < abs(u_imposed) and attempt_count < max_attempts:
         converged = problem.solve()
         reason = problem.solver.getConvergedReason()
         if reason > 0:
+            # Succès
             current_u = target_u
             step_count += 1
+            # Sauvegarder l'état convergé
             u_prev = u.x.array.copy()
             print(f"  OK (reason={reason})")
 
+            # Snapshots
             if step_count in [1, n_steps//4, n_steps//2, n_steps]:
                 u_snapshot = u.x.array.reshape(-1, 2).copy()
                 snapshots.append((current_u, u_snapshot))
 
+            # Mise à jour des historiques
             J_field.interpolate(J_expr)
             j_min = J_field.x.array[cells_gap].min()
             j_max = J_field.x.array[cells_gap].max()
             u_arr = u.x.array.reshape(-1, 2)
             uz_min = u_arr[:,1].min()
             uz_impl = u_arr[cells_impl_nodes, 1].mean()
-            uz_top  = u_arr[node_top_axis, 1]
             hist_steps.append(current_u)
             hist_j_min.append(j_min)
             hist_j_max.append(j_max)
             hist_uz_min.append(uz_min)
             hist_uz_impl.append(uz_impl)
-            hist_uz_top.append(uz_top)
-            hist_step_num.append(step_count)
 
             print(f"  Step {step_count:3d} | u={current_u:.3f} mm | "
                   f"u_z_min={uz_min:.4f} | u_z_impl={uz_impl:.4f} | "
-                  f"u_z_top={uz_top:.4f} | "
                   f"J=[{j_min:.4f},{j_max:.4f}]")
             sys.stdout.flush()
 
+            # Optionnel : on peut réaugmenter le pas
+            # u_per_step = min(u_per_step * 1.2, abs(u_imposed - current_u)/2)
+
         else:
+            # Échec : restaurer l'état précédent, réduire le pas, recréer le problème
             u.x.array[:] = u_prev
             print(f"  Échec (reason={reason}), restauration + réduction du pas")
             sys.stdout.flush()
@@ -295,10 +280,12 @@ while abs(current_u) < abs(u_imposed) and attempt_count < max_attempts:
             if abs(u_per_step) < delta_min:
                 print("  Pas trop petit, arrêt.")
                 break
+            # Recréer le problème pour réinitialiser MUMPS
             problem = make_problem()
             continue
 
     except Exception as e:
+        # Exception : restaurer, réduire, recréer
         u.x.array[:] = u_prev
         print(f"  Exception : {e}, restauration + réduction du pas")
         sys.stdout.flush()
@@ -312,6 +299,7 @@ while abs(current_u) < abs(u_imposed) and attempt_count < max_attempts:
 print(f"Résolution terminée après {step_count} pas convergés (sur {n_steps} initialement prévus).")
 sys.stdout.flush()
 
+#  Résumé final 
 u_array = u.x.array.reshape(-1, 2)
 eps_zz = fem.Function(W0)
 eps_zz.interpolate(fem.Expression(u[1].dx(1), W0.element.interpolation_points))
@@ -344,10 +332,12 @@ jmax_center  = coords[jmax_nodes].mean(axis=0)
 print(f"Cellule J_max — centre : r={jmax_center[0]:.3f} mm, "
       f"z={jmax_center[1]:.3f} mm")
 
+#  Post‑traitement avancé (distorsion) 
+# (on utilise W0 déjà défini)
 eps_rr_expr = u[0].dx(0)
 eps_tt_expr = u[0] / r
 eps_zz_expr = u[1].dx(1)
-eps_rz_expr = eps_rz_tensor(u)   # ε_rz tensorielle — cf. définition explicite plus haut
+eps_rz_expr = 0.5 * (u[0].dx(1) + u[1].dx(0))
 
 eps_rr_field = fem.Function(W0)
 eps_tt_field = fem.Function(W0)
@@ -373,6 +363,7 @@ distorsion_expr = ufl.sqrt(3 * I2_dev_expr)
 distorsion_field = fem.Function(W0)
 distorsion_field.interpolate(fem.Expression(distorsion_expr, W0.element.interpolation_points))
 
+# Statistiques
 eps_rr_gap = eps_rr_field.x.array[cells_gap]
 eps_tt_gap = eps_tt_field.x.array[cells_gap]
 eps_zz_gap = eps_zz_field.x.array[cells_gap]
@@ -388,8 +379,10 @@ print(f"eps_rz : min={eps_rz_gap.min():.4e}  max={eps_rz_gap.max():.4e}  mean={e
 print(f"I2_dev : min={I2_dev_gap.min():.4e}  max={I2_dev_gap.max():.4e}  mean={I2_dev_gap.mean():.4e}")
 print(f"Distorsion : min={dist_gap.min():.4e}  max={dist_gap.max():.4e}  mean={dist_gap.mean():.4e}")
 
+#  Contraintes de Von Mises + déplacements (ensemble du modèle) 
 print("\n--- Contraintes de Von Mises et déplacements (modèle complet) ---")
 
+# Déplacements radial / axial, champs P1 sur tout le domaine
 V_scal = fem.functionspace(domain, ("Lagrange", 1))
 u_r_field = fem.Function(V_scal)
 u_z_field = fem.Function(V_scal)
@@ -398,21 +391,16 @@ u_z_field.name = "u_z"
 u_r_field.interpolate(fem.Expression(u[0], V_scal.element.interpolation_points))
 u_z_field.interpolate(fem.Expression(u[1], V_scal.element.interpolation_points))
 
-V_warp = fem.functionspace(domain, ("Lagrange", 1, (3,)))
-u_warp_field = fem.Function(V_warp)
-u_warp_field.name = "u_warp"
-zero_scalar = fem.Constant(domain, PETSc.ScalarType(0.0))
-u_warp_field.interpolate(fem.Expression(
-    ufl.as_vector([u[0], u[1], zero_scalar]),
-    V_warp.element.interpolation_points))
-
+# Contraintes — zones linéaires (os, implant) : sigma_voigt = C * eps_axi
 def sigma_voigt_lin(u, r, C):
-    eps = strain_axi(u, r)
-    return C * eps
+    eps = strain_axi(u, r)   # [eps_rr, eps_tt, eps_zz, gamma_rz]
+    return C * eps           # [sigma_rr, sigma_tt, sigma_zz, tau_rz]
 
 sig_os   = sigma_voigt_lin(u, r, C_os)
 sig_impl = sigma_voigt_lin(u, r, C_impl)
 
+# Contrainte de Cauchy — zone hyperélastique (gap), via dérivation automatique
+# P = dW/dF (1er Piola-Kirchhoff), sigma = (1/J) * P * F^T (Cauchy)
 F_gap   = deformation_gradient_axi(u, r)
 Fv      = ufl.variable(F_gap)
 Cg      = Fv.T * Fv
@@ -435,62 +423,12 @@ vm_os_expr   = von_mises_axi(sig_os[0],   sig_os[1],   sig_os[2],   sig_os[3])
 vm_impl_expr = von_mises_axi(sig_impl[0], sig_impl[1], sig_impl[2], sig_impl[3])
 vm_gap_expr  = von_mises_axi(sig_gap_rr,  sig_gap_tt,  sig_gap_zz,  sig_gap_rz)
 
+# Champ Von Mises global (DG0), assemblé zone par zone
 vm_field = fem.Function(W0)
-vm_field.name = "von_mises_dg0"
+vm_field.name = "von_mises"
 vm_field.interpolate(fem.Expression(vm_os_expr,   W0.element.interpolation_points), cells_os)
 vm_field.interpolate(fem.Expression(vm_impl_expr, W0.element.interpolation_points), cells_impl)
 vm_field.interpolate(fem.Expression(vm_gap_expr,  W0.element.interpolation_points), cells_gap)
-
-from dolfinx.fem.petsc import LinearProblem
-
-w_test  = ufl.TestFunction(V_scal)
-w_trial = ufl.TrialFunction(V_scal)
-a_proj = ufl.inner(w_trial, w_test) * r * ufl.dx
-L_proj = ufl.inner(vm_field, w_test) * r * ufl.dx
-
-proj_problem = LinearProblem(
-    a_proj, L_proj,
-    petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
-    petsc_options_prefix="vm_proj"
-)
-vm_p1_field = proj_problem.solve()
-vm_p1_field.name = "von_mises"
-
-vm_min_dg0 = float(vm_field.x.array.min())
-vm_min_p1  = float(vm_p1_field.x.array.min())
-print(f"[Vérification Von Mises] min DG0 (brut, calcul physique) : {vm_min_dg0:.6e} MPa")
-print(f"[Vérification Von Mises] min P1  (projeté, visualisation) : {vm_min_p1:.6e} MPa")
-if vm_min_dg0 < -1e-8:
-    print("  -> ALERTE : le champ DG0 brut est négatif.")
-else:
-    print("  -> Le champ DG0 brut est bien >= 0 : le calcul physique des contraintes est correct.")
-
-n_cells_total_diag = domain.topology.index_map(tdim).size_local
-cell_nodes_diag = entities_to_geometry(domain, tdim,
-                                        np.arange(n_cells_total_diag, dtype=np.int32), False)
-n_geom_nodes_diag = domain.geometry.x.shape[0]
-vm_env_min = np.full(n_geom_nodes_diag, np.inf)
-vm_env_max = np.full(n_geom_nodes_diag, -np.inf)
-vm_per_cell_diag = vm_field.x.array[:n_cells_total_diag]
-nodes_per_cell_diag = cell_nodes_diag.shape[1]
-flat_nodes_diag = cell_nodes_diag.flatten()
-flat_vals_diag  = np.repeat(vm_per_cell_diag, nodes_per_cell_diag)
-np.minimum.at(vm_env_min, flat_nodes_diag, flat_vals_diag)
-np.maximum.at(vm_env_max, flat_nodes_diag, flat_vals_diag)
-
-vm_p1_vals = vm_p1_field.x.array
-overshoot_below = np.maximum(vm_env_min - vm_p1_vals, 0.0)
-overshoot_above = np.maximum(vm_p1_vals - vm_env_max, 0.0)
-overshoot = np.maximum(overshoot_below, overshoot_above)
-n_flagged = int((overshoot > 1e-6).sum())
-max_overshoot = float(overshoot.max())
-worst_node = int(np.argmax(overshoot))
-worst_pos = coords[worst_node]
-
-print(f"[Vérification Von Mises] nœuds hors enveloppe DG0 voisine : "
-      f"{n_flagged} / {n_geom_nodes_diag}")
-print(f"[Vérification Von Mises] débordement max (au-delà du min/max voisin) : "
-      f"{max_overshoot:.4f} MPa, au nœud r={worst_pos[0]:.3f} mm, z={worst_pos[1]:.3f} mm")
 
 print(f"Von Mises Os      : min={vm_field.x.array[cells_os].min():.4f}  max={vm_field.x.array[cells_os].max():.4f}  MPa")
 print(f"Von Mises Implant : min={vm_field.x.array[cells_impl].min():.4f}  max={vm_field.x.array[cells_impl].max():.4f}  MPa")
@@ -498,30 +436,41 @@ print(f"Von Mises Gap     : min={vm_field.x.array[cells_gap].min():.4f}  max={vm
 print(f"u_r (modèle)      : min={u_r_field.x.array.min():.4f}  max={u_r_field.x.array.max():.4f}  mm")
 print(f"u_z (modèle)      : min={u_z_field.x.array.min():.4f}  max={u_z_field.x.array.max():.4f}  mm")
 
+#  Sauvegarde XDMF enrichie 
 with XDMFFile(MPI.COMM_WORLD,
               os.path.join(save_dir, "resultats_sans_regularisation.xdmf"), "w") as xdmf:
     xdmf.write_mesh(domain)
-    u.name = "u"
-    xdmf.write_function(u)
-    xdmf.write_function(u_warp_field)
-    xdmf.write_function(vm_p1_field)
-    xdmf.write_function(u_r_field)
-    xdmf.write_function(u_z_field)
     J_field.name = "J"
     xdmf.write_function(J_field)
+    u.name = "u"
+    xdmf.write_function(u)
     xdmf.write_function(vm_field)
+    xdmf.write_function(u_r_field)
+    xdmf.write_function(u_z_field)
+    """  eps_rr_field.name = "eps_rr"
+    xdmf.write_function(eps_rr_field)
+    eps_tt_field.name = "eps_tt"
+    xdmf.write_function(eps_tt_field)
+    eps_zz_field.name = "eps_zz"
+    xdmf.write_function(eps_zz_field)
+    eps_rz_field.name = "eps_rz"
+    xdmf.write_function(eps_rz_field)
+    I2_dev_field.name = "I2_dev"
+    xdmf.write_function(I2_dev_field)
+    distorsion_field.name = "distorsion"
+    xdmf.write_function(distorsion_field)"""
 
 print("Fichier XDMF avancé sauvegardé : resultats_sans_regularisation.xdmf")
 
-import pyvista as pv
+#  Visualisation PyVista 
+"""import pyvista as pv
 import matplotlib.pyplot as plt
 from dolfinx.plot import vtk_mesh
 
 top_vtk, ct_vtk, geo_vtk = vtk_mesh(domain, domain.topology.dim)
 grid = pv.UnstructuredGrid(top_vtk, ct_vtk, geo_vtk)
-grid.cell_data["domaine"]    = cell_tags.values.astype(float)
-grid.cell_data["J"]          = J_field.x.array
-grid.cell_data["von_mises"]  = vm_field.x.array
+grid.cell_data["domaine"] = cell_tags.values.astype(float)
+grid.cell_data["J"]       = J_field.x.array
 
 u_vals = np.zeros((geo_vtk.shape[0], 3))
 u_vals[:,:2] = u_array
@@ -530,44 +479,31 @@ grid.point_data["u_z"]          = u_array[:,1]
 
 grid_def = grid.copy()
 grid_def = grid_def.warp_by_vector("displacement", factor=warp_factor)
-grid_def.cell_data["domaine"]   = cell_tags.values.astype(float)
-grid_def.cell_data["J"]         = J_field.x.array
-grid_def.cell_data["von_mises"] = vm_field.x.array
-grid_def.point_data["u_z"]      = u_array[:,1]
-
-vm_p95 = float(np.percentile(vm_field.x.array, 95))
-grid_def.cell_data["von_mises_clip95"] = np.clip(vm_field.x.array, 0.0, vm_p95)
-print(f"Von Mises — écrêtage visuel (95e percentile) : {vm_p95:.4f} MPa "
-      f"(vs max réel {vm_field.x.array.max():.4f} MPa)")
+grid_def.cell_data["domaine"] = cell_tags.values.astype(float)
+grid_def.cell_data["J"]       = J_field.x.array
+grid_def.point_data["u_z"]    = u_array[:,1]
 
 CMAP = ["#D4915A", "#90C878", "#5A88D4"]
 BG   = "#1a1a2e"
 
-# VUE 1a : Initial
-p1a = pv.Plotter(window_size=[700, 800])
-p1a.background_color = "white"
-p1a.add_text("Initial", font_size=12, color="white", position="upper_edge")
-p1a.add_mesh(grid, scalars="domaine", cmap=CMAP,
-             show_edges=True, edge_color="#555555", line_width=0.4,
-             show_scalar_bar=False)
-p1a.view_xy()
-p1a.show(screenshot=os.path.join(save_dir, "vue1a_initial.png"))
+# VUE 1 : Initial vs Déformé
+p1 = pv.Plotter(shape=(1,2), window_size=[1200,800])
+p1.subplot(0,0)
+p1.background_color = BG
+p1.add_text("Initial", font_size=12, color="white", position="upper_edge")
+p1.add_mesh(grid, scalars="domaine", cmap=CMAP,
+            show_edges=True, edge_color="#555555", line_width=0.4)
+p1.view_xy()
+p1.subplot(0,1)
+p1.background_color = "white"
+p1.add_text(f"Déformé ×{warp_factor}", font_size=12,
+            color="black", position="upper_edge")
+p1.add_mesh(grid_def, scalars="domaine", cmap=CMAP,
+            show_edges=True, edge_color="#555555", line_width=0.4)
+p1.view_xy()
+p1.show()
 
-# VUE 1b : Déformé
-p1b = pv.Plotter(window_size=[700, 800])
-p1b.background_color = "white"
-p1b.add_text(f"Déformé ×{warp_factor}", font_size=12,
-             color="black", position="upper_edge")
-p1b.add_mesh(grid_def, scalars="domaine", cmap=CMAP,
-             show_edges=True, edge_color="#555555", line_width=0.4,
-             show_scalar_bar=False)
-p1b.view_xy()
-p1b.show(screenshot=os.path.join(save_dir, "vue1b_deforme.png"))
-
-grid_def.save(os.path.join(save_dir, "resultats_deformes_von_mises.vtu"))
-print("Maillage déformé (Von Mises exact) sauvegardé : resultats_deformes_von_mises.vtu")
-
-# VUE 2
+# VUE 2 : u_z + gap jaune + J_max rouge
 grid_gap_def = grid_def.extract_cells(
     np.where(cell_tags.values == TAG_GAP)[0])
 grid_jmax    = grid_def.extract_cells(np.array([idx_jmax_gap]))
@@ -587,27 +523,9 @@ p2.add_mesh(grid_gap_def, color="#FFD700", opacity=1.0,
 p2.add_mesh(grid_jmax, color="#FF0000", opacity=1.0,
             show_edges=True, edge_color="#FF0000", line_width=2.0)
 p2.view_xy()
-p2.show(screenshot=os.path.join(save_dir, "vue2_uz.png"))
+p2.show()
 
-# VUE 2bis
-p2b = pv.Plotter(window_size=[700, 900])
-p2b.background_color = BG
-p2b.add_text("Contrainte de Von Mises (déformé)", font_size=12,
-             color="white", position="upper_edge")
-p2b.add_mesh(grid_def, scalars="von_mises", cmap="turbo",
-             show_edges=True, edge_color="#333333", line_width=0.3,
-             smooth_shading=False,
-             scalar_bar_args={"title":"Von Mises (MPa)", "vertical":True,
-                              "color":"white", "title_font_size":14,
-                              "label_font_size":12})
-p2b.add_mesh(grid_gap_def, color="#FFD700", style="wireframe",
-             line_width=2.0, opacity=1.0)
-p2b.add_mesh(grid_jmax, color="#FF0000", opacity=1.0,
-             show_edges=True, edge_color="#FF0000", line_width=2.0)
-p2b.view_xy()
-p2b.show(screenshot=os.path.join(save_dir, "vue2bis_von_mises.png"))
-
-# VUE 3
+# VUE 3 : Zoom zone de contact
 p3 = pv.Plotter(window_size=[900, 600])
 p3.background_color = BG
 p3.add_text("Zoom — zone de contact", font_size=12,
@@ -625,74 +543,58 @@ p3.view_xy()
 p3.camera.position    = (10.0, 13.5, 40.0)
 p3.camera.focal_point = (10.0, 13.5, 0.0)
 p3.camera.view_angle  = 30.0
-p3.show(screenshot=os.path.join(save_dir, "vue3_zoom_contact.png"))
+p3.show()
 
-# VUE 4a
+# VUE 4 : Courbes J_min, J_max + descente implant
 if len(hist_steps) > 0:
     hist_steps   = np.array(hist_steps)
     hist_j_min   = np.array(hist_j_min)
     hist_j_max   = np.array(hist_j_max)
     hist_uz_min  = np.array(hist_uz_min)
     hist_uz_impl = np.array(hist_uz_impl)
-    hist_uz_top  = np.array(hist_uz_top)
-    hist_step_num = np.array(hist_step_num)
     hist_u_plot  = np.abs(hist_steps)
 
-    fig1, ax1 = plt.subplots(figsize=(7, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.patch.set_facecolor("#1a1a2e")
+
+    ax1 = axes[0]
+    ax1.set_facecolor("#0f0f23")
     ax1.plot(hist_u_plot, hist_j_max, color="#FF6B6B", linewidth=2.0,
              marker="o", markersize=4, label="J$_{max}$")
     ax1.plot(hist_u_plot, hist_j_min, color="#4ECDC4", linewidth=2.0,
              marker="s", markersize=4, label="J$_{min}$")
-    ax1.axhline(y=1.0, color="black", linestyle="--", linewidth=0.8,
+    ax1.axhline(y=1.0, color="white", linestyle="--", linewidth=0.8,
                 alpha=0.5, label="J = 1 (référence)")
-    ax1.set_xlabel("Déplacement imposé (mm)", color="black", fontsize=12)
+    ax1.set_xlabel("Déplacement imposé (mm)", color="white", fontsize=12)
     ax1.set_xlim(0, abs(u_imposed))
-    ax1.set_ylabel("Jacobien J", color="black", fontsize=12)
-    ax1.set_title("Évolution du Jacobien dans le troisième milieu", color="black", fontsize=13)
-    ax1.tick_params(colors="black")
+    ax1.set_ylabel("Jacobien J", color="white", fontsize=12)
+    ax1.set_title("Évolution du Jacobien dans le gap", color="white", fontsize=13)
+    ax1.tick_params(colors="white")
     ax1.spines[:].set_color("#444444")
     ax1.legend(facecolor="#0f0f23", labelcolor="white", fontsize=11)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "jacobien_gap.png"), dpi=150,
-                facecolor=fig1.get_facecolor())
-    plt.show()
+    ax1.grid(True, alpha=0.2, color="white")
 
-    fig2, ax2 = plt.subplots(figsize=(7, 5))
+    ax2 = axes[1]
+    ax2.set_facecolor("#0f0f23")
     ax2.plot(hist_u_plot, np.abs(hist_uz_min), color="#FFD700", linewidth=2.0,
              marker="o", markersize=4, label="u$_z$ min global")
     ax2.plot(hist_u_plot, np.abs(hist_uz_impl), color="#FF6B6B", linewidth=2.0,
              marker="s", markersize=4, label="u$_z$ moyen implant")
-    ax2.plot(hist_u_plot, hist_u_plot, color="black", linestyle="--",
+    ax2.plot(hist_u_plot, hist_u_plot, color="white", linestyle="--",
              linewidth=0.8, alpha=0.5, label="u imposé (référence)")
-    ax2.set_xlabel("Déplacement imposé (mm)", color="black", fontsize=12)
+    ax2.set_xlabel("Déplacement imposé (mm)", color="white", fontsize=12)
     ax2.set_xlim(0, abs(u_imposed))
     ax2.set_ylabel("|u$_z$| (mm)", color="white", fontsize=12)
-    ax2.set_title("Descente de l'implant", color="black", fontsize=13)
-    ax2.tick_params(colors="black")
+    ax2.set_title("Descente de l'implant", color="white", fontsize=13)
+    ax2.tick_params(colors="white")
     ax2.spines[:].set_color("#444444")
     ax2.legend(facecolor="#0f0f23", labelcolor="white", fontsize=11)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "descente_implant.png"), dpi=150,
-                facecolor=fig2.get_facecolor())
-    plt.show()
+    ax2.grid(True, alpha=0.2, color="white")
 
-    fig2, ax5 = plt.subplots(figsize=(7, 5))
-    fig2.patch.set_facecolor("#1a1a2e")
-    ax5.set_facecolor("#0f0f23")
-    ax5.plot(hist_step_num, hist_uz_top, color="#4ECDC4",
-             linewidth=2.0, marker="^", markersize=5,
-             label="u$_z$ point haut implant (axe)")
-    ax5.set_xlabel("Numéro de pas convergé (itération)", color="white", fontsize=12)
-    ax5.set_ylabel("u$_z$ (mm)", color="white", fontsize=12)
-    ax5.set_title("Descente du point haut de l'implant vs itérations",
-                  color="white", fontsize=13)
-    ax5.tick_params(colors="white")
-    ax5.spines[:].set_color("#444444")
-    ax5.grid(True, alpha=0.2, color="white")
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "descente_point_haut_implant.png"), dpi=150,
-                facecolor=fig2.get_facecolor())
-    plt.show()
+    plt.savefig(os.path.join(save_dir, "courbes_cones.png"), dpi=150,
+                facecolor=fig.get_facecolor())
+    plt.show()"""
 
 print("Fin !")
 
